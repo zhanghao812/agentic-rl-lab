@@ -18,24 +18,40 @@ uv run python 01-demo-sync.py \
     --swanlab-mode disabled
 """
 
+# 解析命令行参数并生成帮助信息。
 import argparse
+# 用正则表达式提取答案和清理名称。
 import re
+# 记录训练流程耗时。
 import time
+# 为数据类自动生成初始化等方法。
 from dataclasses import dataclass
+# 构造日志目录路径。
 from pathlib import Path
+# 提供类型标注，不改变运行行为。
 from typing import Any, Callable
 
+# 导入数据集类型及加载函数。
 from datasets import Dataset, load_dataset
+# 构造训练接口需要的数值数组。
 import numpy as np
+# 将 PyTRIO 简写为 trio，此处不是同名异步库。
 import pytrio as trio
+# 记录实验配置和指标。
 import swanlab
+# 为自定义损失提供可求导张量运算。
 import torch
+# 显示逐题处理进度。
 from tqdm import tqdm
 
 
+# 要求最终数值答案采用 boxed 格式，以便统一评分。
 QUESTION_SUFFIX = " Provide a numerical answer without units, written inside \\boxed{}."
+# 命令行允许的损失名称。
 LOSS_FNS = ("importance_sampling", "ppo", "cispo")
+# 这些损失由训练服务内置实现。
 BUILTIN_LOSS_FNS = {"importance_sampling", "ppo"}
+# 固定问答示例，用来引导输出格式。
 FEWSHOT_PREFIX = [
     {"role": "user", "content": "How many r's are in strawberry?" + QUESTION_SUFFIX},
     {
@@ -51,102 +67,155 @@ FEWSHOT_PREFIX = [
 ]
 
 
+# 逐行讲解：定义类 GRPOConfig：命令行参数解析后的训练配置。
 @dataclass
 class GRPOConfig:
     """命令行参数解析后的训练配置。"""
 
+    # 基础模型标识。
     base_model: str
+    # LoRA矩阵的秩。
     lora_rank: int
+    # 普通模式循环次数。
     steps: int
+    # 是否遍历全量数据。
     all_data: bool
+    # 每步题目数。
     batch_size: int
+    # 每题回答数。
     group_size: int
+    # 回答token上限。
     max_tokens: int
+    # 采样温度。
     temperature: float
+    # 核采样概率阈值。
     top_p: float
+    # 本地随机种子。
     seed: int
+    # 学习率。
     learning_rate: float
+    # 一阶动量衰减系数。
     beta1: float
+    # 二阶动量衰减系数。
     beta2: float
+    # 损失函数名。
     loss_fn: str
+    # 概率比裁剪下界。
     cispo_clip_low_threshold: float
+    # 概率比裁剪上界。
     cispo_clip_high_threshold: float
+    # 日志模式。
     swanlab_mode: str
+    # 日志项目名。
     swanlab_project: str
 
 
+# 逐行讲解：定义类 RolloutSample：一条采样结果，以及构造 importance_sampling 所需的旧策略 logprobs。
 @dataclass
 class RolloutSample:
     """一条采样结果，以及构造 importance_sampling 所需的旧策略 logprobs。"""
 
+    # 回答token序列。
     tokens: list[int]
+    # 旧策略逐token对数概率。
     logprobs: list[float]
+    # 回答文本。
     text: str
+    # 正确性奖励。
     reward: float
+    # 组内相对优势。
     advantage: float
 
 
+# 逐行讲解：定义函数 parse_args：把训练配置集中到命令行参数，避免依赖环境变量。
 def parse_args() -> GRPOConfig:
     """把训练配置集中到命令行参数，避免依赖环境变量。"""
+    # 创建命令行解析器。
     parser = argparse.ArgumentParser(description="PyTRIO 同步版 GRPO / GSM8K demo")
+    # 逐行讲解：注册命令行选项及其默认值或约束（parser.add_argument('--base-model', default='Qwen/Qwen3.5-4B', help='PyTRIO 基础模型名')）。
     parser.add_argument("--base-model", default="Qwen/Qwen3.5-4B", help="PyTRIO 基础模型名")
+    # 逐行讲解：注册命令行选项及其默认值或约束（parser.add_argument('--lora-rank', type=int, default=32, help='LoRA rank')）。
     parser.add_argument("--lora-rank", type=int, default=32, help="LoRA rank")
+    # 逐行讲解：注册命令行选项及其默认值或约束（parser.add_argument('--steps', type=int, default=10, help='GRPO 优化步数；每步从 GSM8K 取 batch-size 道题做 rollout')）。
     parser.add_argument(
         "--steps",
         type=int,
         default=10,
         help="GRPO 优化步数；每步从 GSM8K 取 batch-size 道题做 rollout",
     )
+    # 逐行讲解：注册命令行选项及其默认值或约束（parser.add_argument('--all-data', action='store_true', help='使用 GSM8K train split 全量数据训练一遍；打开后忽略 --steps')）。
     parser.add_argument(
         "--all-data",
         action="store_true",
         help="使用 GSM8K train split 全量数据训练一遍；打开后忽略 --steps",
     )
+    # 逐行讲解：注册命令行选项及其默认值或约束（parser.add_argument('--batch-size', type=int, default=4, help='每个 step 的 GSM8K 题目数')）。
     parser.add_argument("--batch-size", type=int, default=4, help="每个 step 的 GSM8K 题目数")
+    # 逐行讲解：注册命令行选项及其默认值或约束（parser.add_argument('--group-size', type=int, default=4, help='每道题采样的 completion 数')）。
     parser.add_argument("--group-size", type=int, default=4, help="每道题采样的 completion 数")
+    # 逐行讲解：注册命令行选项及其默认值或约束（parser.add_argument('--max-tokens', type=int, default=1024, help='每次采样最多生成 token 数')）。
     parser.add_argument("--max-tokens", type=int, default=1024, help="每次采样最多生成 token 数")
+    # 逐行讲解：注册命令行选项及其默认值或约束（parser.add_argument('--temperature', type=float, default=1.0, help='采样 temperature')）。
     parser.add_argument("--temperature", type=float, default=1.0, help="采样 temperature")
+    # 逐行讲解：注册命令行选项及其默认值或约束（parser.add_argument('--top-p', type=float, default=1.0, help='采样 top_p')）。
     parser.add_argument("--top-p", type=float, default=1.0, help="采样 top_p")
+    # 逐行讲解：注册命令行选项及其默认值或约束（parser.add_argument('--seed', type=int, default=42, help='本地随机种子')）。
     parser.add_argument("--seed", type=int, default=42, help="本地随机种子")
+    # 逐行讲解：注册命令行选项及其默认值或约束（parser.add_argument('--learning-rate', type=float, default=4e-05, help='Adam learning rate')）。
     parser.add_argument("--learning-rate", type=float, default=4e-5, help="Adam learning rate")
+    # 逐行讲解：注册命令行选项及其默认值或约束（parser.add_argument('--beta1', type=float, default=0.9, help='Adam beta1')）。
     parser.add_argument("--beta1", type=float, default=0.9, help="Adam beta1")
+    # 逐行讲解：注册命令行选项及其默认值或约束（parser.add_argument('--beta2', type=float, default=0.95, help='Adam beta2')）。
     parser.add_argument("--beta2", type=float, default=0.95, help="Adam beta2")
+    # 逐行讲解：注册命令行选项及其默认值或约束（parser.add_argument('--loss-fn', choices=LOSS_FNS, default='importance_sampling', help='训练 loss：importance_…）。
     parser.add_argument(
         "--loss-fn",
         choices=LOSS_FNS,
         default="importance_sampling",
         help="训练 loss：importance_sampling / ppo / cispo",
     )
+    # 逐行讲解：注册命令行选项及其默认值或约束（parser.add_argument('--cispo-clip-low-threshold', type=float, default=0.0, help='CISPO custom loss 的 ratio …）。
     parser.add_argument(
         "--cispo-clip-low-threshold",
         type=float,
         default=0.0,
         help="CISPO custom loss 的 ratio 下界；官方默认 0.0，即不额外设置正下界",
     )
+    # 逐行讲解：注册命令行选项及其默认值或约束（parser.add_argument('--cispo-clip-high-threshold', type=float, default=4.0, help='CISPO custom loss 的 ratio…）。
     parser.add_argument(
         "--cispo-clip-high-threshold",
         type=float,
         default=4.0,
         help="CISPO custom loss 的 ratio 上界；官方默认 4.0",
     )
+    # 逐行讲解：注册命令行选项及其默认值或约束（parser.add_argument('--swanlab-mode', choices=('online', 'disabled'), default='online', help='SwanLab 记录模式：…）。
     parser.add_argument(
         "--swanlab-mode",
         choices=("online", "disabled"),
         default="online",
         help="SwanLab 记录模式：online 上传到云端，disabled 完全关闭日志",
     )
+    # 逐行讲解：注册命令行选项及其默认值或约束（parser.add_argument('--swanlab-project', default='agentic-rl-lab-grpo', help='SwanLab project')）。
     parser.add_argument("--swanlab-project", default="agentic-rl-lab-grpo", help="SwanLab project")
+    # 读取参数，未指定的选项使用默认值。
     args = parser.parse_args()
 
+    # 逐行讲解：检查条件 args.cispo_clip_low_threshold < 0；成立时执行下方分支。
     if args.cispo_clip_low_threshold < 0:
+        # 逐行讲解：抛出异常：ValueError('--cispo-clip-low-threshold must be >= 0')。
         raise ValueError("--cispo-clip-low-threshold must be >= 0")
+    # 逐行讲解：检查条件 args.cispo_clip_high_threshold <= 0；成立时执行下方分支。
     if args.cispo_clip_high_threshold <= 0:
+        # 逐行讲解：抛出异常：ValueError('--cispo-clip-high-threshold must be > 0')。
         raise ValueError("--cispo-clip-high-threshold must be > 0")
+    # 逐行讲解：检查条件 args.cispo_clip_low_threshold > args.cispo_clip_high_threshold；成立时执行下方分支。
     if args.cispo_clip_low_threshold > args.cispo_clip_high_threshold:
+        # 逐行讲解：抛出异常：ValueError('--cispo-clip-low-threshold must be <= --cispo-clip-high-threshold')。
         raise ValueError(
             "--cispo-clip-low-threshold must be <= --cispo-clip-high-threshold"
         )
 
+    # 把解析结果封装为配置对象。
     return GRPOConfig(
         base_model=args.base_model,
         lora_rank=args.lora_rank,
@@ -169,9 +238,12 @@ def parse_args() -> GRPOConfig:
     )
 
 
+# 逐行讲解：定义函数 build_custom_forward_datum：custom loss 先走 cross_entropy forward，所以只传 target_tokens。
 def build_custom_forward_datum(datum: trio.Datum) -> trio.Datum:
     """custom loss 先走 cross_entropy forward，所以只传 target_tokens。"""
+    # 封装一条训练样本及其损失输入。
     return trio.Datum(
+        # 复用原样本的输入 token。
         model_input=datum.model_input,
         loss_fn_inputs={
             "target_tokens": datum.loss_fn_inputs["target_tokens"],
@@ -179,11 +251,14 @@ def build_custom_forward_datum(datum: trio.Datum) -> trio.Datum:
     )
 
 
+# 逐行讲解：定义函数 get_float_tensor_values：从 Datum 里取出 float32 loss input，用于 custom loss 闭包。
 def get_float_tensor_values(datum: trio.Datum, key: str) -> list[float]:
     """从 Datum 里取出 float32 loss input，用于 custom loss 闭包。"""
+    # 读取输入字段底层数据并转换成 Python 浮点数。
     return [float(value) for value in datum.loss_fn_inputs[key].data]
 
 
+# 逐行讲解：定义函数 make_cispo_loss_fn：创建 PyTRIO custom loss 版本的 CISPO。
 def make_cispo_loss_fn(
     sampling_logprobs_list: list[list[float]],
     advantages_list: list[list[float]],
@@ -197,55 +272,74 @@ def make_cispo_loss_fn(
                 target_logprobs * advantages)
     """
 
+    # 逐行讲解：定义函数 cispo_loss_fn：封装下方逻辑，供调用方复用。
     def cispo_loss_fn(
         data: list[trio.Datum],
         logprobs_list: list[Any],
     ) -> tuple[Any, dict[str, float]]:
+        # 逐行讲解：检查条件 not len(data) == len(logprobs_list) == len(sampling_logprobs_list) == len(advantages_list)；成立时执行下方分支。
         if not (
             len(data)
             == len(logprobs_list)
             == len(sampling_logprobs_list)
             == len(advantages_list)
         ):
+            # 逐行讲解：抛出异常：ValueError('CISPO loss got mismatched data/logprob lengths')。
             raise ValueError("CISPO loss got mismatched data/logprob lengths")
 
         # sampling_logprobs_list / advantages_list 来自 rollout 阶段构造好的 GRPO datum；
         # logprobs_list 是 forward_backward_custom 重新 forward 当前模型后返回的可求导 logprob。
+        # 保存各样本的可求导损失。
         datum_losses = []
+        # 收集有效位置的原始概率比，用于日志。
         ratio_chunks = []
+        # 收集有效位置的裁剪后概率比。
         clipped_ratio_chunks = []
+        # 收集是否裁剪的标记，供计算裁剪比例。
         clip_fraction_chunks = []
+        # 日志均值的分母，包含优势为零的预测位置。
         loss_denominator = 0
+        # 累计优势非零的位置数。
         train_tokens = 0
 
+        # 逐样本配对当前概率、旧策略概率和优势。
         for target_logprobs, sampling_values, advantage_values in zip(
             logprobs_list,
             sampling_logprobs_list,
             advantages_list,
             strict=True,
         ):
+            # 转换为 float32，同时保留梯度连接。
             target_logprobs = target_logprobs.float()
+            # 读取当前张量所在设备，确保辅助张量放在同一设备。
             device = target_logprobs.device
+            # 将采样时保存的对数概率转换为张量。
             sampling_logprobs = torch.as_tensor(
                 sampling_values,
                 dtype=torch.float32,
                 device=device,
             )
+            # 将固定优势转换为张量。
             advantages = torch.as_tensor(
                 advantage_values,
                 dtype=torch.float32,
                 device=device,
             )
+            # 逐行讲解：检查条件 not len(target_logprobs) == len(sampling_logprobs) == len(advantages)；成立时执行下方分支。
             if not (
                 len(target_logprobs)
                 == len(sampling_logprobs)
                 == len(advantages)
             ):
+                # 逐行讲解：抛出异常：ValueError('CISPO datum fields must have the same length')。
                 raise ValueError("CISPO datum fields must have the same length")
+            # 把本条样本所有预测位置计入日志分母。
             loss_denominator += int(target_logprobs.numel())
 
             # ratio 衡量当前模型和采样时旧策略对同一个 token 的概率变化。
+            # exp(log p_new - log p_old) 等于新旧策略概率比。
             prob_ratio = torch.exp(target_logprobs - sampling_logprobs)
+            # 将概率比限制在给定上下界内。
             clipped_ratio = torch.clamp(
                 prob_ratio,
                 min=clip_low_threshold,
@@ -255,22 +349,34 @@ def make_cispo_loss_fn(
             # CISPO 的关键是 detach：clip 后的 ratio 只作为固定权重，
             # 梯度只从 target_logprobs 这条路径回传。
             cispo_objective = clipped_ratio.detach() * target_logprobs * advantages
+            # 取负号将最大化目标转为最小化损失，对 token 求和。
             datum_losses.append(-cispo_objective.sum())
 
             # prompt token 的 advantage 是 0，这里只统计真正参与训练的 completion token。
+            # 筛选非零优势位置；零优势的回答 token 也会被排除。
             train_mask = advantages != 0.0
+            # 仅在存在有效位置时计算统计量。
             if torch.any(train_mask):
+                # 断开梯度，再提取有效位置的原始概率比。
                 detached_ratio = prob_ratio.detach()[train_mask]
+                # 提取对应的裁剪后权重，不参与求导。
                 detached_clipped_ratio = clipped_ratio.detach()[train_mask]
+                # 逐行讲解：向列表末尾追加一个元素（ratio_chunks.append(detached_ratio)）。
                 ratio_chunks.append(detached_ratio)
+                # 逐行讲解：向列表末尾追加一个元素（clipped_ratio_chunks.append(detached_clipped_ratio)）。
                 clipped_ratio_chunks.append(detached_clipped_ratio)
+                # 逐行讲解：向列表末尾追加一个元素（clip_fraction_chunks.append((detached_ratio != detached_clipped_ratio).float())）。
                 clip_fraction_chunks.append(
                     (detached_ratio != detached_clipped_ratio).float()
                 )
+                # 累加本样本非零优势位置数。
                 train_tokens += int(train_mask.sum().item())
 
+        # 实际反向传播使用损失总和，不按 token 数取平均。
         loss = torch.stack(datum_losses).sum()
+        # 提取无梯度的标量副本，仅用于日志。
         loss_value = float(loss.detach().item())
+        # 逐行讲解：构造字典 {'loss_mean': loss_value / loss_denominator if loss_denominator > 0 else 0.0, 'cispo/train_tokens': float(t…，赋给 metrics。
         metrics = {
             # 监控只对齐 PyTRIO 内置 loss 的 loss_mean。
             "loss_mean": (
@@ -280,10 +386,15 @@ def make_cispo_loss_fn(
             "cispo/clip_low_threshold": float(clip_low_threshold),
             "cispo/clip_high_threshold": float(clip_high_threshold),
         }
+        # 存在有效位置时才计算概率比统计。
         if ratio_chunks:
+            # 将不同样本的有效位置拼接后统计。
             ratios = torch.cat(ratio_chunks)
+            # 拼接裁剪后的概率比。
             clipped_ratios = torch.cat(clipped_ratio_chunks)
+            # 拼接裁剪标记。
             clip_fractions = torch.cat(clip_fraction_chunks)
+            # 逐行讲解：调用 metrics.update（metrics.update({'cispo/ratio_mean': float(ratios.mean().item()), 'cispo/clipped_ratio_mean': float(clipped_…）。
             metrics.update(
                 {
                     "cispo/ratio_mean": float(ratios.mean().item()),
@@ -291,78 +402,118 @@ def make_cispo_loss_fn(
                     "cispo/clip_fraction": float(clip_fractions.mean().item()),
                 }
             )
+        # 返回可求导损失以及普通数值指标。
         return loss, metrics
 
+    # 返回捕获旧概率、优势和裁剪阈值的闭包。
     return cispo_loss_fn
 
 
+# 逐行讲解：定义函数 extract_boxed：取最后一个 \boxed{...} 作为模型最终答案。
 def extract_boxed(text: str) -> str | None:
     """取最后一个 \\boxed{...} 作为模型最终答案。"""
+    # 查找所有非空 boxed 内容；此正则不支持嵌套花括号。
     matches = re.findall(r"\\boxed\{([^}]+)\}", text)
+    # 没有符合格式的答案时返回缺失标记。
     if not matches:
+        # 逐行讲解：返回结果：None。
         return None
+    # 取最后一次匹配并清理首尾空白。
     return matches[-1].strip()
 
 
+# 逐行讲解：定义函数 normalize_answer：GSM8K 答案只做轻量归一化，避免 1,000 和 1000 被判成不同。
 def normalize_answer(text: str) -> str:
     """GSM8K 答案只做轻量归一化，避免 1,000 和 1000 被判成不同。"""
+    # 去掉千分位逗号、首尾空白和末尾句点，不进行数值等价转换。
     return text.replace(",", "").strip().rstrip(".")
 
 
+# 逐行讲解：定义函数 grade_answer：boxed answer 与标准答案完全一致时给 1，否则给 0。
 def grade_answer(response: str, ground_truth: str) -> float:
     """boxed answer 与标准答案完全一致时给 1，否则给 0。"""
+    # 提取模型给出的最终答案。
     answer = extract_boxed(response)
+    # 缺少 boxed 答案时判为错误。
     if answer is None:
+        # 逐行讲解：返回结果：0.0。
         return 0.0
+    # 比较归一化字符串，完全相同奖励为 1，否则为 0。
     return 1.0 if normalize_answer(answer) == normalize_answer(ground_truth) else 0.0
 
 
+# 逐行讲解：定义函数 extract_gsm8k_answer：GSM8K 的最终答案位于 `####` 后面。
 def extract_gsm8k_answer(answer_text: str) -> str:
     """GSM8K 的最终答案位于 `####` 后面。"""
+    # 寻找 GSM8K 标准解答中的最终答案分隔符。
     match = re.search(r"####\s*(.+)", answer_text)
+    # 标准答案格式不符合预期时明确报错。
     if match is None:
+        # 逐行讲解：抛出异常：ValueError(f'No GSM8K final answer found: {answer_text!r}')。
         raise ValueError(f"No GSM8K final answer found: {answer_text!r}")
+    # 取出分隔符后的答案并归一化。
     return normalize_answer(match.group(1))
 
 
+# 逐行讲解：定义函数 build_prompt：把 few-shot + 当前题目渲染成模型输入 tokens。
 def build_prompt(tokenizer: Any, question: str) -> list[int]:
     """把 few-shot + 当前题目渲染成模型输入 tokens。"""
+    # 组合示例对话和当前题目。
     messages = [
+        # 展开示例消息并保持顺序。
         *FEWSHOT_PREFIX,
         {"role": "user", "content": question + QUESTION_SUFFIX},
     ]
+    # 使用模型聊天模板添加角色及分隔标记。
     prompt_text = tokenizer.apply_chat_template(
         messages,
+        # 先返回字符串，稍后统一编码。
         tokenize=False,
+        # 追加助手回答的起始提示。
         add_generation_prompt=True,
+        # 向聊天模板传入关闭思考模式的选项。
         enable_thinking=False,
     )
+    # 模板已有特殊标记，因此不再额外添加特殊 token。
     prompt_tokens = tokenizer.encode(prompt_text, add_special_tokens=False)
+    # 拒绝空提示，保证有位置预测首个回答 token。
     if not prompt_tokens:
+        # 逐行讲解：抛出异常：ValueError('Prompt tokens are empty')。
         raise ValueError("Prompt tokens are empty")
+    # 返回采样和训练共用的提示 token。
     return prompt_tokens
 
 
+# 逐行讲解：定义函数 load_gsm8k_train：加载 GSM8K 训练集；首次运行会由 datasets 下载缓存。
 def load_gsm8k_train() -> Dataset:
     """加载 GSM8K 训练集；首次运行会由 datasets 下载缓存。"""
+    # 加载 GSM8K main 配置的训练划分。
     dataset = load_dataset("openai/gsm8k", "main", split="train")
+    # 确认返回的是可索引的数据集。
     if not isinstance(dataset, Dataset):
+        # 逐行讲解：抛出异常：TypeError(f'Expected Dataset, got {type(dataset)!r}')。
         raise TypeError(f"Expected Dataset, got {type(dataset)!r}")
+    # 逐行讲解：返回结果：dataset。
     return dataset
 
 
+# 逐行讲解：定义函数 get_stop_sequences：采样停止符尽量贴近 chat template，同时避免 None 和重复项。
 def get_stop_sequences(tokenizer: Any) -> list[str]:
     """采样停止符尽量贴近 chat template，同时避免 None 和重复项。"""
+    # 收集模型结束标记与常见聊天结束标记。
     candidates = [tokenizer.eos_token, "<|im_end|>"]
+    # 过滤空值，再利用字典保持顺序并去重。
     return list(dict.fromkeys([token for token in candidates if token]))
 
 
+# 逐行讲解：定义函数 run_rollout_group：同步采样一个 prompt 的 group_size 个 completion，并计算组内 advantage。
 def run_rollout_group(
     sampling_client: Any,
     tokenizer: Any,
     prompt_tokens: list[int],
     ground_truth: str,
     sampling_params: trio.SamplingParams,
+    # 每题回答数。
     group_size: int,
 ) -> list[RolloutSample]:
     """同步采样一个 prompt 的 group_size 个 completion，并计算组内 advantage。"""
@@ -376,66 +527,92 @@ def run_rollout_group(
 
     # 先把本组内每个回答的 token、旧策略 logprob、文本和 reward 收集起来。
     # advantage 需要等整组 reward 都算完后，减去组内均值才能得到。
+    # 按回答顺序收集奖励。
     rewards: list[float] = []
+    # 暂存回答，待整组评分后计算优势。
     raw_samples: list[tuple[list[int], list[float], str]] = []
 
+    # 逐条处理同题生成结果。
     for sequence in result.sequences:
         # return_text=True 时通常会直接返回文本；如果没有文本，就用 tokenizer 从 token 解码。
+        # 优先读取服务返回的文本。
         text = sequence.text
+        # 服务没有返回文本时从 token 解码。
         if text is None:
+            # 逐行讲解：将 token 解码为文本（tokenizer.decode(sequence.tokens, skip_special_tokens=True)），赋给 text。
             text = tokenizer.decode(sequence.tokens, skip_special_tokens=True)
 
         # PyTRIO 采样返回 completion token 的 logprobs；
         # 后续 importance_sampling loss 需要用这组 logprobs 作为“采样时旧策略”的概率。
+        # 仅保存生成回答的 token，不包含提示。
         tokens = list(sequence.tokens)
+        # 保存采样策略对每个回答 token 的对数概率。
         logprobs = [float(value) for value in sequence.logprobs]
+        # 确保每个回答 token 都有对应的旧概率。
         if len(tokens) != len(logprobs):
+            # 逐行讲解：抛出异常：ValueError(f'Generated token/logprob length mismatch: {len(tokens)} != {len(logprobs)}')。
             raise ValueError(
                 f"Generated token/logprob length mismatch: {len(tokens)} != {len(logprobs)}"
             )
 
         # reward 只看模型回答里最后一个 \boxed{}，和 GSM8K 标准答案一致则为 1，否则为 0。
         reward = grade_answer(text, ground_truth)
+        # 保存奖励用于计算组内均值。
         rewards.append(reward)
+        # 保持回答内容与奖励顺序一致。
         raw_samples.append((tokens, logprobs, text))
 
     # GRPO 的核心是组内相对优势：同一道题里，比平均 reward 高的回答得到正 advantage。
+    # 计算同一道题的平均奖励，假定采样组非空。
     mean_reward = sum(rewards) / len(rewards)
+    # 逐行讲解：返回结果：[RolloutSample(tokens=tokens, logprobs=logprobs, text=text, reward=reward, advantage=reward - mean_reward) …。
     return [
         RolloutSample(
             tokens=tokens,
             logprobs=logprobs,
             text=text,
             reward=reward,
+            # 本实现只减去组均值，没有除以标准差。
             advantage=reward - mean_reward,
         )
         for (tokens, logprobs, text), reward in zip(raw_samples, rewards, strict=True)
     ]
 
 
+# 逐行讲解：定义函数 build_grpo_datum：把单条 completion 转成 PyTRIO importance_sampling 所需的 Datum。
 def build_grpo_datum(prompt_tokens: list[int], sample: RolloutSample) -> trio.Datum:
     """把单条 completion 转成 PyTRIO importance_sampling 所需的 Datum。"""
+    # 没有回答 token 时无法构造训练目标。
     if not sample.tokens:
+        # 逐行讲解：抛出异常：ValueError('Cannot train on an empty completion')。
         raise ValueError("Cannot train on an empty completion")
 
     # 自回归对齐方式如下：
     # input = prompt + completion[:-1]
     # target 前 observation_len 个位置属于 prompt 内部预测，不训练，用 0 / 0.0 占位；
     # 从最后一个 prompt token 开始预测 completion 的每个 token。
+    # 提示长 P 时，内部有 P-1 个不参与策略学习的位置。
     observation_len = len(prompt_tokens) - 1
+    # 输入为提示加回答的前 C-1 个 token，总长 P+C-1。
     input_tokens = prompt_tokens + sample.tokens[:-1]
+    # 前 P-1 个目标用零占位，随后对齐 C 个回答 token。
     target_tokens = [0] * observation_len + sample.tokens
+    # 提示内部位置补零，再拼接采样时的真实概率。
     padded_logprobs = [0.0] * observation_len + sample.logprobs
+    # 提示位置优势为零，回答各位置共享同一个序列级优势。
     padded_advantages = [0.0] * observation_len + [sample.advantage] * len(sample.tokens)
 
+    # 逐行讲解：检查条件 not len(input_tokens) == len(target_tokens) == len(padded_logprobs) == len(padded_advantages)；成立时执行下方分支。
     if not (
         len(input_tokens)
         == len(target_tokens)
         == len(padded_logprobs)
         == len(padded_advantages)
     ):
+        # 逐行讲解：抛出异常：ValueError('GRPO datum fields must have the same token length')。
         raise ValueError("GRPO datum fields must have the same token length")
 
+    # 封装一条训练样本及其损失输入。
     return trio.Datum(
         model_input=trio.ModelInput.from_ints(input_tokens),
         loss_fn_inputs={
@@ -446,41 +623,60 @@ def build_grpo_datum(prompt_tokens: list[int], sample: RolloutSample) -> trio.Da
     )
 
 
+# 逐行讲解：定义函数 get_num_steps：计算实际训练 step 数；all-data 模式会覆盖命令行里的 steps。
 def get_num_steps(dataset: Dataset, config: GRPOConfig) -> int:
     """计算实际训练 step 数；all-data 模式会覆盖命令行里的 steps。"""
+    # 逐行讲解：检查条件 config.all_data；成立时执行下方分支。
     if config.all_data:
+        # 向上取整，使最后不足一个批次的数据也被覆盖。
         return (len(dataset) + config.batch_size - 1) // config.batch_size
+    # 非全量模式使用指定循环次数。
     return config.steps
 
 
+# 逐行讲解：定义函数 model_slug：把模型名压成适合 experiment / weights name 的短名称。
 def model_slug(base_model: str) -> str:
     """把模型名压成适合 experiment / weights name 的短名称。"""
+    # 移除模型组织路径并转换为小写。
     name = base_model.rsplit("/", 1)[-1].lower()
+    # 简化特定模型版本号的写法。
     name = name.replace("qwen3.5", "qwen35")
+    # 将非字母数字字符替换为连字符并清理两端。
     return re.sub(r"[^a-z0-9]+", "-", name).strip("-")
 
 
+# 逐行讲解：定义函数 build_run_name：SwanLab experiment name 和最终权重名共用同一个规则生成值。
 def build_run_name(config: GRPOConfig, effective_steps: int) -> str:
     """SwanLab experiment name 和最终权重名共用同一个规则生成值。"""
+    # 将损失名称转换成适合实验名的形式。
     loss_slug = config.loss_fn.replace("_", "-")
+    # 逐行讲解：返回结果：f'grpo-sync-{model_slug(config.base_model)}-gsm8k-{loss_slug}-steps{effective_steps}'。
     return (
         f"grpo-sync-{model_slug(config.base_model)}-gsm8k-"
         f"{loss_slug}-steps{effective_steps}"
     )
 
 
+# 逐行讲解：定义函数 pick_batch：取当前 step 的 batch；all-data 模式下不回绕，确保每条样本最多用一次。
 def pick_batch(dataset: Dataset, step: int, batch_size: int, all_data: bool) -> Dataset:
     """取当前 step 的 batch；all-data 模式下不回绕，确保每条样本最多用一次。"""
+    # 按从零开始的步号计算批次起点。
     start = step * batch_size
+    # 逐行讲解：检查条件 all_data；成立时执行下方分支。
     if all_data:
+        # 全量模式避免索引超出数据集。
         end = min(start + batch_size, len(dataset))
+        # 生成左闭右开的连续样本索引。
         indices = list(range(start, end))
     else:
         # 非 all-data 模式保留原来的回绕逻辑，允许 steps 超过数据集可切出的完整 batch 数。
+        # 取模实现循环读取；这里不会随机打乱数据。
         indices = [(start + offset) % len(dataset) for offset in range(batch_size)]
+    # 按索引取出本步题目。
     return dataset.select(indices)
 
 
+# 逐行讲解：定义函数 init_swanlab_run：SwanLab 只记录关键 GRPO 指标，不影响主训练逻辑。
 def init_swanlab_run(
     config: GRPOConfig,
     effective_steps: int,
@@ -488,8 +684,11 @@ def init_swanlab_run(
     run_name: str,
 ) -> Any | None:
     """SwanLab 只记录关键 GRPO 指标，不影响主训练逻辑。"""
+    # 日志禁用时不创建实验。
     if config.swanlab_mode == "disabled":
+        # 逐行讲解：返回结果：None。
         return None
+    # 创建实验并保存配置。
     return swanlab.init(
         project=config.swanlab_project,
         name=run_name,
@@ -517,64 +716,92 @@ def init_swanlab_run(
             "seed": config.seed,
             "weights_name": run_name,
         },
+        # 把日志保存到脚本旁的 swanlog 目录。
         log_dir=str(Path(__file__).resolve().parent / "swanlog"),
     )
 
 
+# 逐行讲解：定义函数 get_numeric_metric：按当前 PyTRIO 实际返回的 metric key 精确取值，不做模糊匹配。
 def get_numeric_metric(loss_metrics: dict[str, Any], key: str) -> float | None:
     """按当前 PyTRIO 实际返回的 metric key 精确取值，不做模糊匹配。"""
+    # 按精确名称读取指标，缺失时得到 None。
     value = loss_metrics.get(key)
+    # 只接受 Python 整数或浮点指标。
     if isinstance(value, int | float):
+        # 统一转换为浮点数。
         return float(value)
+    # 逐行讲解：返回结果：None。
     return None
 
 
+# 逐行讲解：定义函数 count_train_tokens：统计非零 advantage 的 token 数，也就是实际参与 RL loss 的 completion token。
 def count_train_tokens(datums: list[trio.Datum]) -> int:
     """统计非零 advantage 的 token 数，也就是实际参与 RL loss 的 completion token。"""
+    # 初始化有效 token 总数。
     total = 0
+    # 逐条读取训练样本的优势。
     for datum in datums:
+        # 每个非零优势位置累计一次。
         total += sum(
             1
             for value in datum.loss_fn_inputs["advantages"].data
             if float(value) != 0.0
         )
+    # 返回批次中非零优势位置总数。
     return total
 
 
+# 逐行讲解：定义函数 main：封装下方逻辑，供调用方复用。
 def main(config: GRPOConfig) -> None:
+    # 只设置本地 NumPy 种子，不等于设置远程采样随机种子。
     np.random.seed(config.seed)
 
+    # 逐行讲解：调用 print（print('Loading GSM8K dataset...')）。
     print("Loading GSM8K dataset...")
+    # 加载题目，后续按原顺序取批次。
     train_data = load_gsm8k_train()
+    # 逐行讲解：调用 print（print(f'Loaded {len(train_data)} GSM8K training examples')）。
     print(f"Loaded {len(train_data)} GSM8K training examples")
+    # 结合全量模式计算实际循环次数。
     effective_steps = get_num_steps(train_data, config)
+    # 生成实验名和最终权重名。
     run_name = build_run_name(config, effective_steps)
+    # 逐行讲解：调用 print（print(f'Run / weights name: {run_name}')）。
     print(f"Run / weights name: {run_name}")
+    # 逐行讲解：检查条件 config.all_data；成立时执行下方分支。
     if config.all_data:
+        # 逐行讲解：调用 print（print(f'All-data mode: {effective_steps} steps will cover {len(train_data)} examples once')）。
         print(
             f"All-data mode: {effective_steps} steps will cover "
             f"{len(train_data)} examples once"
         )
 
+    # 逐行讲解：调用 print（print('Creating PyTRIO clients...')）。
     print("Creating PyTRIO clients...")
+    # 创建 PyTRIO 服务入口。
     service_client = trio.ServiceClient()
+    # 创建指定基础模型的 LoRA 训练客户端。
     training_client = service_client.create_lora_training_client(
         base_model=config.base_model,
         rank=config.lora_rank,
     )
+    # 获取与训练模型匹配的分词器。
     tokenizer = training_client.get_tokenizer()
 
+    # 配置生成长度、采样随机性和停止条件。
     sampling_params = trio.SamplingParams(
         max_tokens=config.max_tokens,
         temperature=config.temperature,
         top_p=config.top_p,
         stop=get_stop_sequences(tokenizer),
     )
+    # 配置 Adam 更新参数。
     adam_params = trio.AdamParams(
         learning_rate=config.learning_rate,
         beta1=config.beta1,
         beta2=config.beta2,
     )
+    # 按配置初始化实验，禁用时为 None。
     swanlab_run = init_swanlab_run(
         config=config,
         effective_steps=effective_steps,
@@ -582,8 +809,11 @@ def main(config: GRPOConfig) -> None:
         run_name=run_name,
     )
 
+    # 逐行讲解：执行可能失败的操作，异常处理及收尾逻辑见下方分支。
     try:
+        # 每轮完成取题、采样、评分和可能的权重更新。
         for step in range(effective_steps):
+            # 取出当前步的题目批次。
             batch_rows = pick_batch(
                 train_data,
                 step,
@@ -594,14 +824,22 @@ def main(config: GRPOConfig) -> None:
             # 采样必须使用当前策略，所以每个 step 先保存临时匿名 LoRA 权重并创建 sampler。
             sampling_client = training_client.save_weights_and_get_sampling_client()
 
+            # 保存本轮有学习信号的训练样本。
             datums: list[trio.Datum] = []
+            # 保存各题组平均奖励，包括退化组。
             prompt_mean_rewards: list[float] = []
+            # 保存全部回答的生成长度。
             rollout_lengths: list[int] = []
+            # 初始化没有组内学习信号的题目数。
             n_degenerate = 0
 
+            # 逐题同步处理并显示进度。
             for row in tqdm(batch_rows, desc=f"GRPO step {step}", unit="prompt"):
+                # 将当前题目编码成聊天提示。
                 prompt_tokens = build_prompt(tokenizer, row["question"])
+                # 从数据集解答提取标准答案。
                 ground_truth = extract_gsm8k_answer(row["answer"])
+                # 生成同题多个回答并计算奖励和优势。
                 rollout_samples = run_rollout_group(
                     sampling_client=sampling_client,
                     tokenizer=tokenizer,
@@ -611,22 +849,32 @@ def main(config: GRPOConfig) -> None:
                     group_size=config.group_size,
                 )
 
+                # 将该题所有回答长度加入统计。
                 rollout_lengths.extend(len(sample.tokens) for sample in rollout_samples)
+                # 提取同题各回答奖励。
                 rewards = [sample.reward for sample in rollout_samples]
+                # 计算该题平均正确率。
                 prompt_mean_reward = sum(rewards) / len(rewards)
+                # 保存该题平均奖励供批次统计。
                 prompt_mean_rewards.append(prompt_mean_reward)
 
                 # 同一题 group 内 reward 完全一样时，advantage 全为 0，没有训练信号，直接跳过。
                 if all(sample.advantage == 0.0 for sample in rollout_samples):
+                    # 记录一个全对或全错、没有相对学习信号的组。
                     n_degenerate += 1
+                    # 跳过该题的训练样本构造，继续下一题。
                     continue
 
+                # 对有效组中的每条回答构造样本。
                 for sample in rollout_samples:
+                    # 对齐提示与回答的训练字段，加入批次。
                     datums.append(build_grpo_datum(prompt_tokens, sample))
 
+            # 存在有效样本时才执行更新。
             if datums:
                 # importance_sampling / ppo 都使用 PyTRIO 内置 loss，同一套 GRPO datum 可复用。
                 if config.loss_fn in BUILTIN_LOSS_FNS:
+                    # 提交内置损失的前向和反向计算。
                     fwd_bwd_future = training_client.forward_backward(
                         datums,
                         loss_fn=config.loss_fn,
@@ -634,15 +882,19 @@ def main(config: GRPOConfig) -> None:
                 # CISPO 走本地 custom loss：forward datums 只保留 target_tokens，
                 # rollout 旧 logprobs 和 advantages 通过闭包传给 loss_fn。
                 elif config.loss_fn == "cispo":
+                    # 自定义前向只保留模型输入和目标 token。
                     custom_datums = [
                         build_custom_forward_datum(datum) for datum in datums
                     ]
+                    # 按样本顺序提取旧策略概率供闭包使用。
                     sampling_logprobs_list = [
                         get_float_tensor_values(datum, "logprobs") for datum in datums
                     ]
+                    # 按相同顺序提取逐 token 优势。
                     advantages_list = [
                         get_float_tensor_values(datum, "advantages") for datum in datums
                     ]
+                    # 提交使用本地损失回调的前向反向任务。
                     fwd_bwd_future = training_client.forward_backward_custom(
                         custom_datums,
                         make_cispo_loss_fn(
@@ -653,19 +905,29 @@ def main(config: GRPOConfig) -> None:
                         ),
                     )
                 else:
+                    # 逐行讲解：抛出异常：ValueError(f'Unsupported loss function: {config.loss_fn}')。
                     raise ValueError(f"Unsupported loss function: {config.loss_fn}")
 
                 # 同步版 PyTRIO：提交远程前向/反向和优化器更新后，显式 `.result()` 等待完成。
+                # 提交 Adam 权重更新任务。
                 optim_future = training_client.optim_step(adam_params)
+                # 等待前向反向计算完成并读取结果。
                 fwd_bwd_result = fwd_bwd_future.result()
+                # 等待更新完成，下一轮使用更新后的权重采样。
                 optim_future.result()
+                # 把返回指标转换为普通字典。
                 loss_metrics = dict(fwd_bwd_result.metrics)
             else:
+                # 整批均无训练信号时不更新，也没有本步损失。
                 loss_metrics = {}
 
+            # 读取损失均值；缺失时保留 None。
             loss_mean = get_numeric_metric(loss_metrics, "loss_mean")
+            # 统计当前批次实际具有非零优势的位置。
             train_tokens = count_train_tokens(datums)
+            # 按题目平均得到本轮奖励。
             mean_reward = sum(prompt_mean_rewards) / len(prompt_mean_rewards)
+            # 计算所有生成回答的平均长度。
             avg_gen_len = (
                 sum(rollout_lengths) / len(rollout_lengths)
                 if rollout_lengths
@@ -673,8 +935,11 @@ def main(config: GRPOConfig) -> None:
             )
             # 退化 group 指同一道题的所有回答 reward 都一样，advantage 全为 0，没有相对优劣信号。
             # 这个比例越高，说明当前 batch 里真正用于 GRPO 学习的题目越少。
+            # 计算没有相对学习信号的题目占比。
             frac_degenerate = n_degenerate / len(prompt_mean_rewards)
+            # 仅在实验已启用时执行日志操作。
             if swanlab_run is not None:
+                # 汇总本步的奖励、长度、训练量和损失指标。
                 log_payload = {
                     "reward": mean_reward,
                     "frac_degenerate": frac_degenerate,
@@ -687,12 +952,18 @@ def main(config: GRPOConfig) -> None:
                         if key == "loss_mean" or key.startswith("cispo/")
                     },
                 }
+                # 只在存在损失值时记录损失曲线。
                 if loss_mean is not None:
+                    # 逐行讲解：取值 loss_mean，赋给 log_payload['loss']。
                     log_payload["loss"] = loss_mean
+                    # 逐行讲解：取值 loss_mean，赋给 log_payload['loss_mean']。
                     log_payload["loss_mean"] = loss_mean
+                # 按训练循环步号记录本轮指标。
                 swanlab.log(log_payload, step=step)
 
+            # 缺失损失显示为 n/a，否则保留四位小数。
             loss_mean_text = "n/a" if loss_mean is None else f"{loss_mean:.4f}"
+            # 逐行讲解：调用 print（print(f'Step {step:2d} | reward: {mean_reward:.3f} | degenerate: {frac_degenerate:.0%} | datums: {len(datum…）。
             print(
                 f"Step {step:2d} | reward: {mean_reward:.3f} | "
                 f"degenerate: {frac_degenerate:.0%} | datums: {len(datums)} | "
@@ -701,22 +972,37 @@ def main(config: GRPOConfig) -> None:
                 f"loss_mean: {loss_mean_text} | loss_fn: {config.loss_fn}"
             )
 
+        # 逐行讲解：调用 print（print('Saving final LoRA weights for sampler...')）。
         print("Saving final LoRA weights for sampler...")
+        # 保存最终用于采样的 LoRA 权重并等待完成。
         final_weights = training_client.save_weights_for_sampler(
             name=run_name
         ).result()
+        # 逐行讲解：调用 print（print(f'Saved weights name: {run_name}, path: {final_weights.path}')）。
         print(f"Saved weights name: {run_name}, path: {final_weights.path}")
+    # 即使训练报错，也执行日志收尾。
     finally:
+        # 仅在实验已启用时执行日志操作。
         if swanlab_run is not None:
+            # 结束本次实验记录。
             swanlab_run.finish()
 
 
+# 仅直接运行文件时启动训练，导入时不执行。
 if __name__ == "__main__":
+    # 解析训练配置。
     cli_config = parse_args()
+    # 记录主流程开始时间。
     start_main_time = time.time()
+    # 运行完整同步训练流程。
     main(cli_config)
+    # 记录正常结束时间，用于计算耗时。
     end_main_time = time.time()
+    # 逐行讲解：调用 print（print('#' * 50)）。
     print("#" * 50)
+    # 逐行讲解：调用 print（print('# all done')）。
     print("# all done")
+    # 逐行讲解：调用 print（print(f'# train cost {end_main_time - start_main_time:.2f}s')）。
     print(f"# train cost {end_main_time - start_main_time:.2f}s")
+    # 逐行讲解：调用 print（print('#' * 50)）。
     print("#" * 50)
